@@ -157,6 +157,7 @@ function MahjongApp() {
   const [scores, setScores] = useState({});
   const [step, setStep] = useState(1);
   const [editingSession, setEditingSession] = useState(null);
+  const [gameDate, setGameDate] = useState(() => new Date().toISOString().split("T")[0]);
 
   const [viewPlayer, setViewPlayer] = useState(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
@@ -279,7 +280,7 @@ function MahjongApp() {
 
   const startScoreEntry = () => {
     if (selPlayers.length < 2) return;
-    const s = {}; selPlayers.forEach(id => (s[id] = "")); setScores(s); setStep(2);
+    const s = {}; selPlayers.forEach(id => (s[id] = "")); setScores(s); setGameDate(new Date().toISOString().split("T")[0]); setStep(2);
   };
 
   const setScore = (id, val) => {
@@ -300,7 +301,7 @@ function MahjongApp() {
     Object.entries(scores).forEach(([id, v]) => (parsed[id] = parseFloat(v)));
     const session = {
       id: editingSession || genId(),
-      date: new Date().toISOString(),
+      date: new Date(gameDate + "T20:00:00").toISOString(),
       scores: parsed,
       transactions: minimizeTransactions(parsed),
     };
@@ -309,14 +310,14 @@ function MahjongApp() {
     setTab("history");
   };
 
-  const resetForm = () => { setSelPlayers([]); setScores({}); setStep(1); setEditingSession(null); };
+  const resetForm = () => { setSelPlayers([]); setScores({}); setStep(1); setEditingSession(null); setGameDate(new Date().toISOString().split("T")[0]); };
 
   const editSession = (session) => {
     setEditingSession(session.id);
     const ids = Object.keys(session.scores);
     setSelPlayers(ids);
     const s = {}; ids.forEach(id => (s[id] = session.scores[id].toString()));
-    setScores(s); setStep(2); setTab("new");
+    setScores(s); setGameDate(session.date.split("T")[0]); setStep(2); setTab("new");
   };
 
   const deleteSession = async (id) => {
@@ -618,6 +619,14 @@ function MahjongApp() {
 
             {step === 2 && (
               <>
+                <div className="lbl">Game date</div>
+                <input type="date" value={gameDate} onChange={e => setGameDate(e.target.value)}
+                  style={{
+                    width: "100%", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)",
+                    borderRadius: 10, padding: "12px 14px", color: "#c9a84c", fontSize: 15,
+                    fontFamily: "'Outfit', sans-serif", outline: "none", marginBottom: 20,
+                    colorScheme: "dark",
+                  }} />
                 <div className="lbl">Enter final scores (S$)</div>
                 {selPlayers.map(id => (
                   <div key={id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
@@ -845,4 +854,5 @@ function MahjongApp() {
     </div>
   );
 }
+
 
