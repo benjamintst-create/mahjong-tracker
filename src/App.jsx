@@ -163,6 +163,8 @@ function MahjongApp() {
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [editingPlayerName, setEditingPlayerName] = useState(null);
   const [editNameVal, setEditNameVal] = useState("");
+  const [leaderboardFilter, setLeaderboardFilter] = useState("all");
+  const [rivalryAlert, setRivalryAlert] = useState(null);
 
   // ─── Real-time Firestore listeners ───
   useEffect(() => {
@@ -299,6 +301,11 @@ function MahjongApp() {
   const confirmSettle = async () => {
     const parsed = {};
     Object.entries(scores).forEach(([id, v]) => (parsed[id] = parseFloat(v)));
+    // Detect rivalries before saving
+    if (!editingSession) {
+      const alerts = detectRivalries(parsed);
+      if (alerts.length > 0) setRivalryAlert(alerts);
+    }
     const session = {
       id: editingSession || genId(),
       date: new Date(gameDate + "T20:00:00").toISOString(),
@@ -459,6 +466,76 @@ function MahjongApp() {
       });
     }
     window.open(`https://wa.me/?text=${encodeURIComponent(msg)}`, "_blank");
+  };
+
+  // ─── Filtered leaderboard ───
+  const filteredStats = useMemo(() => {
+    const now = new Date();
+    const filtered = history.filter(h => {
+      if (!h.scores) return false;
+      if (leaderboardFilter === "all") return true;
+      const d = new Date(h.date);
+      if (leaderboardFilter === "month") return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
+      if (leaderboardFilter === "year") return d.getFullYear() === now.getFullYear();
+      return true;
+    });
+    const stats = {};
+    filtered.forEach(h => {
+      Object.entries(h.scores).forEach(([id, score]) => {
+        if (!stats[id]) stats[id] = { total: 0, games: 0, wins: 0, losses: 0 };
+        stats[id].total += score; stats[id].games += 1;
+        if (score > 0) stats[id].wins += 1;
+        if (score < 0) stats[id].losses += 1;
+      });
+    });
+    return Object.entries(stats).map(([id, s]) => ({ id, ...s })).sort((a, b) => b.total - a.total);
+  }, [history, leaderboardFilter]);
+
+  // ─── Hall of Shame ───
+  const hallOfShame = useMemo(() => {
+    let worst = { id: null, score: 0, date: null };
+    let biggest = { id: null, score: 0, date: null };
+    history.forEach(h => {
+      if (!h.scores) return;
+      Object.entries(h.scores).forEach(([id, score]) => {
+        if (score < worst.score) worst = { id, score, date: h.date };
+        if (score > biggest.score) biggest = { id, score, date: h.date };
+      });
+    });
+    return { worst, biggest };
+  }, [history]);
+
+  // ─── Rivalry detection ───
+  const detectRivalries = (newScores) => {
+    // Build old rankings from history
+    const oldTotals = {};
+    history.forEach(h => {
+      if (!h.scores) return;
+      Object.entries(h.scores).forEach(([id, score]) => {
+        oldTotals[id] = (oldTotals[id] || 0) + score;
+      });
+    });
+    const oldRanking = Object.entries(oldTotals).sort((a, b) => b[1] - a[1]).map(([id]) => id);
+
+    // Build new rankings including this session
+    const newTotals = { ...oldTotals };
+    Object.entries(newScores).forEach(([id, score]) => {
+      newTotals[id] = (newTotals[id] || 0) + score;
+    });
+    const newRanking = Object.entries(newTotals).sort((a, b) => b[1] - a[1]).map(([id]) => id);
+
+    // Check for overtakes
+    const alerts = [];
+    newRanking.forEach((id, newPos) => {
+      const oldPos = oldRanking.indexOf(id);
+      if (oldPos > 0 && newPos < oldPos) {
+        const overtaken = oldRanking[newPos];
+        if (overtaken && overtaken !== id) {
+          alerts.push(`${getEmoji(id)} ${getName(id)} overtakes ${getEmoji(overtaken)} ${getName(overtaken)} to #${newPos + 1}!`);
+        }
+      }
+    });
+    return alerts;
   };
 
   // ─── Styles ───
@@ -994,10 +1071,60 @@ function MahjongApp() {
               </div>
             )}
 
-            <div className="lbl">Lifetime Leaderboard</div>
-            {!lifetimeStats.length ? (
-              <div style={{ textAlign: "center", padding: "50px 20px", opacity: 0.4 }}>Play some games first!</div>
-            ) : lifetimeStats.map((s, i) => {
+            {/* Hall of Fame & Shame */}
+            {(hallOfShame.biggest.id || hallOfShame.worst.id) && (
+              <div className="card" style={{ marginBottom: 16 }}>
+                <div className="lbl">Records</div>
+                {hallOfShame.biggest.id && (
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: hallOfShame.worst.id ? "1px solid rgba(255,255,255,0.04)" : "none" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 20 }}>🏆</span>
+                      <div>
+                        <div style={{ fontSize: 12, opacity: 0.4 }}>Biggest Win Ever</div>
+                        <div style={{ fontWeight: 500 }}>{getEmoji(hallOfShame.biggest.id)} {getName(hallOfShame.biggest.id)}</div>
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <span className="pos" style={{ fontFamily: "'Crimson Pro', serif", fontWeight: 700, fontSize: 18 }}>+${hallOfShame.biggest.score.toFixed(2)}</span>
+                      <div style={{ fontSize: 10, opacity: 0.3 }}>{new Date(hallOfShame.biggest.date).toLocaleDateString("en-SG", { day: "numeric", month: "short" })}</div>
+                    </div>
+                  </div>
+                )}
+                {hallOfShame.worst.id && (
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 20 }}>💀</span>
+                      <div>
+                        <div style={{ fontSize: 12, opacity: 0.4 }}>Hall of Shame</div>
+                        <div style={{ fontWeight: 500 }}>{getEmoji(hallOfShame.worst.id)} {getName(hallOfShame.worst.id)}</div>
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <span className="neg" style={{ fontFamily: "'Crimson Pro', serif", fontWeight: 700, fontSize: 18 }}>${hallOfShame.worst.score.toFixed(2)}</span>
+                      <div style={{ fontSize: 10, opacity: 0.3 }}>{new Date(hallOfShame.worst.date).toLocaleDateString("en-SG", { day: "numeric", month: "short" })}</div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Leaderboard filter tabs */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
+              <div className="lbl" style={{ marginBottom: 0 }}>Leaderboard</div>
+              <div style={{ display: "flex", gap: 4 }}>
+                {[["all", "All Time"], ["year", new Date().getFullYear().toString()], ["month", new Date().toLocaleDateString("en-SG", { month: "short" })]].map(([key, label]) => (
+                  <button key={key} className="btn" onClick={() => setLeaderboardFilter(key)} style={{
+                    padding: "4px 10px", borderRadius: 6, fontSize: 11, fontWeight: 600,
+                    background: leaderboardFilter === key ? "rgba(201,168,76,0.2)" : "rgba(255,255,255,0.04)",
+                    color: leaderboardFilter === key ? "#c9a84c" : "rgba(232,220,200,0.4)",
+                    border: `1px solid ${leaderboardFilter === key ? "rgba(201,168,76,0.3)" : "rgba(255,255,255,0.06)"}`,
+                  }}>{label}</button>
+                ))}
+              </div>
+            </div>
+            {!filteredStats.length ? (
+              <div style={{ textAlign: "center", padding: "50px 20px", opacity: 0.4 }}>No sessions in this period</div>
+            ) : filteredStats.map((s, i) => {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : null;
               return (
                 <div key={s.id} onClick={() => setViewPlayer(s.id)} style={{
@@ -1023,6 +1150,34 @@ function MahjongApp() {
           </div>
         )}
       </div>
+
+      {/* Rivalry Alert Popup */}
+      {rivalryAlert && (
+        <div onClick={() => setRivalryAlert(null)} style={{
+          position: "fixed", top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999,
+          background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center",
+          padding: 20, cursor: "pointer",
+        }}>
+          <div onClick={e => e.stopPropagation()} style={{
+            background: "linear-gradient(135deg, #1a2e1a, #2a3f2a)", borderRadius: 20, padding: "28px 24px",
+            maxWidth: 340, width: "100%", textAlign: "center",
+            border: "1px solid rgba(201,168,76,0.3)", boxShadow: "0 20px 60px rgba(0,0,0,0.5)",
+            animation: "fadeIn 0.3s",
+          }}>
+            <div style={{ fontSize: 48, marginBottom: 12 }}>⚔️</div>
+            <div style={{ fontFamily: "'Crimson Pro', serif", fontSize: 22, fontWeight: 700, color: "#c9a84c", marginBottom: 16 }}>
+              Ranking Shakeup!
+            </div>
+            {rivalryAlert.map((alert, i) => (
+              <div key={i} style={{ fontSize: 15, marginBottom: 8, lineHeight: 1.5 }}>{alert}</div>
+            ))}
+            <button className="btn" onClick={() => setRivalryAlert(null)} style={{
+              marginTop: 16, padding: "12px 32px", borderRadius: 12, fontSize: 15, fontWeight: 600,
+              background: "rgba(201,168,76,0.2)", color: "#c9a84c", border: "1px solid rgba(201,168,76,0.3)",
+            }}>Nice 🔥</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
