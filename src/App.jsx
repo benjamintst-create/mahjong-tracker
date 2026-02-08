@@ -373,6 +373,94 @@ function MahjongApp() {
     });
   };
 
+  // ─── Head-to-head stats ───
+  const getHeadToHead = (playerId) => {
+    const h2h = {};
+    history.forEach(session => {
+      if (!session.scores || session.scores[playerId] === undefined) return;
+      const myScore = session.scores[playerId];
+      Object.entries(session.scores).forEach(([oppId, oppScore]) => {
+        if (oppId === playerId) return;
+        if (!h2h[oppId]) h2h[oppId] = { games: 0, wins: 0, losses: 0, draws: 0, myTotal: 0, oppTotal: 0 };
+        h2h[oppId].games += 1;
+        h2h[oppId].myTotal += myScore;
+        h2h[oppId].oppTotal += oppScore;
+        if (myScore > oppScore) h2h[oppId].wins += 1;
+        else if (myScore < oppScore) h2h[oppId].losses += 1;
+        else h2h[oppId].draws += 1;
+      });
+    });
+    return Object.entries(h2h)
+      .map(([id, s]) => ({ id, ...s }))
+      .sort((a, b) => b.games - a.games);
+  };
+
+  // ─── Streak tracking ───
+  const getPlayerStreaks = (playerId) => {
+    const sorted = [...history].filter(h => h.scores && h.scores[playerId] !== undefined);
+    let currentStreak = { type: null, count: 0 };
+    let bestWin = 0, bestLoss = 0;
+    let tempType = null, tempCount = 0;
+    sorted.forEach(h => {
+      const score = h.scores[playerId];
+      const type = score > 0.005 ? "W" : score < -0.005 ? "L" : "D";
+      if (type === tempType) { tempCount += 1; }
+      else { tempType = type; tempCount = 1; }
+      if (tempType === "W" && tempCount > bestWin) bestWin = tempCount;
+      if (tempType === "L" && tempCount > bestLoss) bestLoss = tempCount;
+    });
+    // Current streak (most recent)
+    if (sorted.length > 0) {
+      const lastScore = sorted[0].scores[playerId];
+      const lastType = lastScore > 0.005 ? "W" : lastScore < -0.005 ? "L" : "D";
+      let count = 0;
+      for (const h of sorted) {
+        const s = h.scores[playerId];
+        const t = s > 0.005 ? "W" : s < -0.005 ? "L" : "D";
+        if (t === lastType) count++;
+        else break;
+      }
+      currentStreak = { type: lastType, count };
+    }
+    return { currentStreak, bestWinStreak: bestWin, bestLossStreak: bestLoss };
+  };
+
+  // ─── Export CSV ───
+  const exportCSV = () => {
+    const allPlayerIds = [...new Set(history.flatMap(h => h.scores ? Object.keys(h.scores) : []))];
+    const header = ["Date", ...allPlayerIds.map(id => getName(id))];
+    const rows = history.map(h => {
+      const date = new Date(h.date).toLocaleDateString("en-SG", { day: "numeric", month: "short", year: "numeric" });
+      const scores = allPlayerIds.map(id => h.scores?.[id] !== undefined ? h.scores[id].toFixed(2) : "");
+      return [date, ...scores];
+    });
+    const csv = [header, ...rows].map(r => r.join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `mahjong-scores-${new Date().toISOString().split("T")[0]}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+  };
+
+  // ─── WhatsApp share ───
+  const shareWhatsApp = () => {
+    const parsed = {}; Object.entries(scores).forEach(([id, v]) => (parsed[id] = parseFloat(v)));
+    const txns = minimizeTransactions(parsed);
+    const dateStr = new Date(gameDate).toLocaleDateString("en-SG", { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+    let msg = `🀄 *Mahjong Settlement* — ${dateStr}\n\n`;
+    msg += `*Scores:*\n`;
+    Object.entries(parsed).sort((a, b) => b[1] - a[1]).forEach(([id, val]) => {
+      msg += `${getEmoji(id)} ${getName(id)}: ${val > 0 ? "+" : ""}$${val.toFixed(2)}\n`;
+    });
+    if (txns.length) {
+      msg += `\n*Payments:*\n`;
+      txns.forEach(t => {
+        msg += `${getName(t.from)} → ${getName(t.to)}: $${t.amount.toFixed(2)}\n`;
+      });
+    }
+    window.open(`https://wa.me/?text=${encodeURIComponent(msg)}`, "_blank");
+  };
+
   // ─── Styles ───
   const CSS = `
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -503,6 +591,73 @@ function MahjongApp() {
               ))}
             </div>
           )}
+
+          {/* Streaks */}
+          {stats && (() => {
+            const streaks = getPlayerStreaks(viewPlayer);
+            return (
+              <div className="card" style={{ marginBottom: 16 }}>
+                <div className="lbl">Streaks</div>
+                {[
+                  ["Current", streaks.currentStreak.count > 0
+                    ? `${streaks.currentStreak.count}${streaks.currentStreak.type}`
+                    : "—",
+                    streaks.currentStreak.type === "W" ? "#7dce82" : streaks.currentStreak.type === "L" ? "#e87c6c" : "#c9a84c"
+                  ],
+                  ["Best win streak", streaks.bestWinStreak > 0 ? `${streaks.bestWinStreak}W` : "—", "#7dce82"],
+                  ["Worst loss streak", streaks.bestLossStreak > 0 ? `${streaks.bestLossStreak}L` : "—", "#e87c6c"],
+                ].map(([label, value, color], i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderBottom: i < 2 ? "1px solid rgba(255,255,255,0.04)" : "none" }}>
+                    <span style={{ opacity: 0.6, fontSize: 14 }}>{label}</span>
+                    <span style={{ fontFamily: "'Crimson Pro', serif", fontWeight: 700, fontSize: 16, color }}>{value}</span>
+                  </div>
+                ))}
+              </div>
+            );
+          })()}
+
+          {/* Head-to-Head */}
+          {stats && (() => {
+            const h2h = getHeadToHead(viewPlayer);
+            if (!h2h.length) return null;
+            return (
+              <div className="card" style={{ marginBottom: 16 }}>
+                <div className="lbl">Head-to-Head</div>
+                {h2h.map((opp, i) => {
+                  const oppPlayer = players.find(p => p.id === opp.id);
+                  if (!oppPlayer) return null;
+                  const winPct = opp.games > 0 ? (opp.wins / opp.games * 100).toFixed(0) : 0;
+                  return (
+                    <div key={opp.id} style={{ padding: "12px 0", borderBottom: i < h2h.length - 1 ? "1px solid rgba(255,255,255,0.04)" : "none" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                          <span style={{ fontSize: 18 }}>{oppPlayer.emoji}</span>
+                          <span style={{ fontWeight: 500, fontSize: 14 }}>{oppPlayer.name}</span>
+                        </div>
+                        <span style={{ fontSize: 13, opacity: 0.5 }}>{opp.games} games</span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 6 }}>
+                        <div style={{ flex: 1, height: 6, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+                          <div style={{
+                            height: "100%", borderRadius: 3,
+                            width: `${winPct}%`,
+                            background: parseInt(winPct) >= 50 ? "#7dce82" : "#e87c6c",
+                            transition: "width 0.3s",
+                          }} />
+                        </div>
+                        <span style={{
+                          fontSize: 13, fontWeight: 700, fontFamily: "'Crimson Pro', serif",
+                          color: opp.wins > opp.losses ? "#7dce82" : opp.wins < opp.losses ? "#e87c6c" : "#c9a84c",
+                        }}>
+                          {opp.wins}W {opp.losses}L{opp.draws > 0 ? ` ${opp.draws}D` : ""}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            );
+          })()}
 
           {data.length > 1 && (
             <div className="card" style={{ marginBottom: 16 }}>
@@ -712,6 +867,14 @@ function MahjongApp() {
                   <button className="btn" onClick={() => setStep(2)} style={{ padding: "14px 20px", borderRadius: 12, background: "rgba(255,255,255,0.06)", color: "rgba(232,220,200,0.6)", fontSize: 15 }}>← Back</button>
                   <button className="btn" onClick={confirmSettle} style={{ flex: 1, padding: 16, borderRadius: 12, fontSize: 16, fontWeight: 600, background: "linear-gradient(135deg, #7dce82, #5aad5f)", color: "#1a2e1a" }}>Confirm & Save ✓</button>
                 </div>
+                <button className="btn" onClick={shareWhatsApp} style={{
+                  width: "100%", marginTop: 10, padding: 14, borderRadius: 12, fontSize: 14, fontWeight: 600,
+                  background: "rgba(37,211,102,0.12)", color: "#25d366",
+                  border: "1px solid rgba(37,211,102,0.25)",
+                  display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+                }}>
+                  📱 Share via WhatsApp
+                </button>
               </>
             )}
           </div>
@@ -751,7 +914,16 @@ function MahjongApp() {
         {/* HISTORY */}
         {tab === "history" && (
           <div style={{ animation: "fadeIn 0.3s" }}>
-            <div className="lbl">Past Sessions · {history.length}</div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+              <div className="lbl" style={{ marginBottom: 0 }}>Past Sessions · {history.length}</div>
+              {history.length > 0 && (
+                <button className="btn" onClick={exportCSV} style={{
+                  padding: "6px 12px", borderRadius: 8, fontSize: 12, fontWeight: 500,
+                  background: "rgba(201,168,76,0.1)", color: "#c9a84c",
+                  border: "1px solid rgba(201,168,76,0.2)",
+                }}>📥 Export CSV</button>
+              )}
+            </div>
             {!history.length ? (
               <div style={{ textAlign: "center", padding: "50px 20px", opacity: 0.4 }}>No sessions yet</div>
             ) : history.map(h => {
@@ -854,5 +1026,3 @@ function MahjongApp() {
     </div>
   );
 }
-
-
