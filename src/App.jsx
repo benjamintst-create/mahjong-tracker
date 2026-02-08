@@ -626,7 +626,16 @@ function MahjongApp() {
                       <span style={{ fontWeight: 500, fontSize: 16 }}>{getName(id)}</span>
                     </div>
                     <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                      <span style={{ opacity: 0.3, fontSize: 14 }}>$</span>
+                      <button className="btn" onClick={() => {
+                        const cur = scores[id];
+                        if (!cur || cur === "0" || cur === "0.00") return;
+                        setScore(id, cur.startsWith("-") ? cur.slice(1) : "-" + cur);
+                      }} style={{
+                        background: scores[id]?.startsWith("-") ? "rgba(232,124,108,0.15)" : "rgba(125,206,130,0.15)",
+                        color: scores[id]?.startsWith("-") ? "#e87c6c" : "#7dce82",
+                        border: "1px solid " + (scores[id]?.startsWith("-") ? "rgba(232,124,108,0.25)" : "rgba(125,206,130,0.25)"),
+                        borderRadius: 8, padding: "8px 10px", fontSize: 14, fontWeight: 700, minWidth: 36,
+                      }}>±</button>
                       <input className="score-input" type="text" inputMode="decimal" placeholder="0.00" value={scores[id]} onChange={e => setScore(id, e.target.value)} />
                     </div>
                   </div>
@@ -836,3 +845,4 @@ function MahjongApp() {
     </div>
   );
 }
+
