@@ -2,12 +2,33 @@ import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine, Cell } from "recharts";
 import { db } from "./firebase";
 import {
-  collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy
+  collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy, runTransaction
 } from "firebase/firestore";
 
 const MAX_PLAYERS = 20;
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 const AUTH_KEY = "mj-auth-v1";
+
+const SINGAPORE_TIME_ZONE = "Asia/Singapore";
+const singaporeDateFormatter = new Intl.DateTimeFormat("en-GB", {
+  timeZone: SINGAPORE_TIME_ZONE, year: "numeric", month: "2-digit", day: "2-digit",
+});
+
+function getSingaporeDate(value = new Date()) {
+  const parts = Object.fromEntries(singaporeDateFormatter.formatToParts(new Date(value)).map(p => [p.type, p.value]));
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function formatGameDate(value, options = { weekday: "short", day: "numeric", month: "short", year: "numeric" }) {
+  return new Date(value).toLocaleDateString("en-SG", { ...options, timeZone: SINGAPORE_TIME_ZONE });
+}
+
+function sessionDateISO(day) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return null;
+  const date = new Date(`${day}T20:00:00+08:00`);
+  if (Number.isNaN(date.getTime()) || getSingaporeDate(date) !== day) return null;
+  return date.toISOString();
+}
 
 // BEGIN TEMPORARY DUPLICATE CLEANUP: grouping helper.
 // Remove this block and the two matching blocks in MahjongApp after cleanup.
@@ -183,11 +204,19 @@ function MahjongApp() {
   const [scores, setScores] = useState({});
   const [step, setStep] = useState(1);
   const [editingSession, setEditingSession] = useState(null);
+  const [editingOriginalDate, setEditingOriginalDate] = useState(null);
   const [draftId, setDraftId] = useState(null);
   const [saving, setSaving] = useState(false);
   const savingRef = useRef(false);
   const [saveError, setSaveError] = useState(null);
-  const [gameDate, setGameDate] = useState(() => new Date().toISOString().split("T")[0]);
+  const [gameDate, setGameDate] = useState(() => getSingaporeDate());
+  const [historyMonth, setHistoryMonth] = useState("all");
+  const [historyPlayer, setHistoryPlayer] = useState("all");
+  const [deletedSessions, setDeletedSessions] = useState([]);
+  const [historyError, setHistoryError] = useState(null);
+  const [historyNotice, setHistoryNotice] = useState(null);
+  const [sessionBusyIds, setSessionBusyIds] = useState(new Set());
+  const sessionBusyRef = useRef(new Set());
 
   const [viewPlayer, setViewPlayer] = useState(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
@@ -338,6 +367,10 @@ function MahjongApp() {
   const getEmoji = (id) => players.find(p => p.id === id)?.emoji || "🀄";
   const getColor = (id) => CHART_COLORS[players.findIndex(p => p.id === id) % CHART_COLORS.length];
 
+  const lastSession = history.find(session => session.scores && Object.keys(session.scores).length >= 2);
+  const lastPlayerIds = lastSession ? Object.keys(lastSession.scores).filter(id => players.some(p => p.id === id)).slice(0, 4) : [];
+  const currentSingaporeDate = getSingaporeDate();
+
   const togglePlayer = (id) => {
     setSelPlayers(prev => prev.includes(id) ? prev.filter(p => p !== id) : prev.length < 4 ? [...prev, id] : prev);
   };
@@ -347,7 +380,9 @@ function MahjongApp() {
     // Keep the same ID when going Back or retrying an uncertain/failed save.
     if (!editingSession) setDraftId(current => current || genId());
     setSaveError(null);
-    const s = {}; selPlayers.forEach(id => (s[id] = "")); setScores(s); setGameDate(new Date().toISOString().split("T")[0]); setStep(2);
+    const s = {}; selPlayers.forEach(id => (s[id] = scores[id] ?? "")); setScores(s);
+    if (!editingSession && !draftId) setGameDate(getSingaporeDate());
+    setStep(2);
   };
 
   const setScore = (id, val) => {
@@ -362,6 +397,7 @@ function MahjongApp() {
   };
 
   const getTotal = () => Object.values(scores).reduce((s, v) => { const n = parseFloat(v); return s + (isNaN(n) ? 0 : n); }, 0);
+  const validGameDate = sessionDateISO(gameDate) !== null;
 
   const confirmSettle = async () => {
     if (savingRef.current) return;
@@ -372,6 +408,10 @@ function MahjongApp() {
     }
     if (!scoresValid()) {
       setSaveError("Enter all scores and make sure they total $0.00 before saving.");
+      return;
+    }
+    if (!validGameDate) {
+      setSaveError("Choose a valid game date before saving.");
       return;
     }
 
@@ -386,12 +426,15 @@ function MahjongApp() {
       const alerts = editingSession ? [] : detectRivalries(parsed, sessionId);
       const session = {
         id: sessionId,
-        date: new Date(gameDate + "T20:00:00").toISOString(),
+        date: sessionDateISO(gameDate),
         scores: parsed,
         transactions: minimizeTransactions(parsed),
       };
       await fbSaveSession(session);
       if (alerts.length > 0) setRivalryAlert(alerts);
+      setHistoryNotice(editingSession ? "Changes saved." : "Game saved.");
+      setHistoryMonth("all");
+      setHistoryPlayer("all");
       resetForm();
       setTab("history");
     } catch (err) {
@@ -403,23 +446,83 @@ function MahjongApp() {
     }
   };
 
-  const resetForm = () => { setSelPlayers([]); setScores({}); setStep(1); setEditingSession(null); setDraftId(null); setSaveError(null); setGameDate(new Date().toISOString().split("T")[0]); };
+  const resetForm = () => { setSelPlayers([]); setScores({}); setStep(1); setEditingSession(null); setEditingOriginalDate(null); setDraftId(null); setSaveError(null); setGameDate(getSingaporeDate()); };
+
+  const cancelEditing = () => {
+    if (savingRef.current) return;
+    resetForm();
+    setTab("history");
+  };
 
   const editSession = (session) => {
-    if (savingRef.current) return;
+    if (savingRef.current || sessionBusyRef.current.has(session.id)) return;
     setDraftId(null);
     setSaveError(null);
     setEditingSession(session.id);
+    setEditingOriginalDate(session.date);
     const ids = Object.keys(session.scores);
     setSelPlayers(ids);
     const s = {}; ids.forEach(id => (s[id] = session.scores[id].toString()));
-    setScores(s); setGameDate(session.date.split("T")[0]); setStep(2); setTab("new");
+    setScores(s); setGameDate(getSingaporeDate(session.date)); setStep(2); setTab("new");
   };
 
-  const deleteSession = async (id) => {
-    if (!confirm("Delete this session?")) return;
-    await fbDeleteSession(id);
+  const setSessionBusy = (id, busy) => {
+    if (busy) sessionBusyRef.current.add(id);
+    else sessionBusyRef.current.delete(id);
+    setSessionBusyIds(new Set(sessionBusyRef.current));
   };
+
+  const deleteSession = async (session) => {
+    if (savingRef.current || sessionBusyRef.current.has(session.id)) return;
+    if (!confirm(`Delete the game from ${formatGameDate(session.date)}?\n\nYou can undo this while this page stays open.`)) return;
+    setSessionBusy(session.id, true);
+    setHistoryError(null);
+    setHistoryNotice(null);
+    // End this edit now; a delayed delete response must not reset a newer draft.
+    if (editingSession === session.id) resetForm();
+    try {
+      await fbDeleteSession(session.id);
+      setDeletedSessions(prev => [session, ...prev.filter(s => s.id !== session.id)]);
+    } catch (err) {
+      console.error("Session deletion failed:", err);
+      setHistoryError("Couldn't delete that game. Check your connection and try again.");
+    } finally {
+      setSessionBusy(session.id, false);
+    }
+  };
+
+  const undoDelete = async (session) => {
+    if (sessionBusyRef.current.has(session.id)) return;
+    setSessionBusy(session.id, true);
+    setHistoryError(null);
+    try {
+      // Restore the same ID without overwriting a copy restored/edited elsewhere.
+      await runTransaction(db, async transaction => {
+        const ref = doc(db, "sessions", session.id);
+        const existing = await transaction.get(ref);
+        if (existing.exists()) throw new Error("session-already-exists");
+        transaction.set(ref, { date: session.date, scores: session.scores, transactions: session.transactions || [] });
+      });
+      setDeletedSessions(prev => prev.filter(s => s.id !== session.id));
+      setHistoryMonth("all");
+      setHistoryPlayer("all");
+      setHistoryNotice("Game restored.");
+    } catch (err) {
+      console.error("Undo deletion failed:", err);
+      setHistoryError(err.message === "session-already-exists"
+        ? "This game is already in History. Its existing scores have been kept."
+        : "Couldn't restore that game. Keep this page open and try Undo again.");
+    } finally {
+      setSessionBusy(session.id, false);
+    }
+  };
+
+  const historyMonths = useMemo(() => [...new Set(history.map(h => getSingaporeDate(h.date).slice(0, 7)))].sort().reverse(), [history]);
+  const historyPlayerIds = useMemo(() => [...new Set(history.flatMap(h => Object.keys(h.scores || {})))].sort((a, b) => getName(a).localeCompare(getName(b))), [history, players]);
+  const filteredHistory = useMemo(() => history.filter(h =>
+    (historyMonth === "all" || getSingaporeDate(h.date).startsWith(historyMonth)) &&
+    (historyPlayer === "all" || Object.prototype.hasOwnProperty.call(h.scores || {}, historyPlayer))
+  ), [history, historyMonth, historyPlayer]);
 
   // ─── Computed stats ───
   const lifetimeStats = useMemo(() => {
@@ -443,7 +546,7 @@ function MahjongApp() {
     const running = {};
     return sorted.map((h, i) => {
       if (!h.scores) return null;
-      const point = { name: new Date(h.date).toLocaleDateString("en-SG", { day: "numeric", month: "short" }), idx: i + 1 };
+      const point = { name: formatGameDate(h.date, { day: "numeric", month: "short" }), idx: i + 1 };
       Object.entries(h.scores).forEach(([id, score]) => { running[id] = (running[id] || 0) + score; });
       Object.entries(running).forEach(([id, total]) => { point[id] = parseFloat(total.toFixed(2)); });
       return point;
@@ -462,7 +565,7 @@ function MahjongApp() {
     return sorted.filter(h => h.scores && h.scores[playerId] !== undefined).map(h => {
       cumulative += h.scores[playerId];
       return {
-        name: new Date(h.date).toLocaleDateString("en-SG", { day: "numeric", month: "short" }),
+        name: formatGameDate(h.date, { day: "numeric", month: "short" }),
         score: h.scores[playerId],
         cumulative: parseFloat(cumulative.toFixed(2)),
       };
@@ -522,11 +625,11 @@ function MahjongApp() {
   };
 
   // ─── Export CSV ───
-  const exportCSV = () => {
-    const allPlayerIds = [...new Set(history.flatMap(h => h.scores ? Object.keys(h.scores) : []))];
+  const exportCSV = (sessions = history) => {
+    const allPlayerIds = [...new Set(sessions.flatMap(h => h.scores ? Object.keys(h.scores) : []))];
     const header = ["Date", ...allPlayerIds.map(id => getName(id))];
-    const rows = history.map(h => {
-      const date = new Date(h.date).toLocaleDateString("en-SG", { day: "numeric", month: "short", year: "numeric" });
+    const rows = sessions.map(h => {
+      const date = formatGameDate(h.date, { day: "numeric", month: "short", year: "numeric" });
       const scores = allPlayerIds.map(id => h.scores?.[id] !== undefined ? h.scores[id].toFixed(2) : "");
       return [date, ...scores];
     });
@@ -534,7 +637,7 @@ function MahjongApp() {
     const blob = new Blob([csv], { type: "text/csv" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = `mahjong-scores-${new Date().toISOString().split("T")[0]}.csv`;
+    a.href = url; a.download = `mahjong-scores-${getSingaporeDate()}.csv`;
     a.click(); URL.revokeObjectURL(url);
   };
 
@@ -542,7 +645,7 @@ function MahjongApp() {
   const shareWhatsApp = () => {
     const parsed = {}; Object.entries(scores).forEach(([id, v]) => (parsed[id] = parseFloat(v)));
     const txns = minimizeTransactions(parsed);
-    const dateStr = new Date(gameDate).toLocaleDateString("en-SG", { weekday: "short", day: "numeric", month: "short", year: "numeric" });
+    const dateStr = formatGameDate(gameDate, { weekday: "short", day: "numeric", month: "short", year: "numeric" });
     let msg = `🀄 *Mahjong Settlement* — ${dateStr}\n\n`;
     msg += `*Scores:*\n`;
     Object.entries(parsed).sort((a, b) => b[1] - a[1]).forEach(([id, val]) => {
@@ -559,13 +662,13 @@ function MahjongApp() {
 
   // ─── Filtered leaderboard ───
   const filteredStats = useMemo(() => {
-    const now = new Date();
+    const now = currentSingaporeDate;
     const filtered = history.filter(h => {
       if (!h.scores) return false;
       if (leaderboardFilter === "all") return true;
-      const d = new Date(h.date);
-      if (leaderboardFilter === "month") return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear();
-      if (leaderboardFilter === "year") return d.getFullYear() === now.getFullYear();
+      const day = getSingaporeDate(h.date);
+      if (leaderboardFilter === "month") return day.slice(0, 7) === now.slice(0, 7);
+      if (leaderboardFilter === "year") return day.slice(0, 4) === now.slice(0, 4);
       return true;
     });
     const stats = {};
@@ -578,7 +681,7 @@ function MahjongApp() {
       });
     });
     return Object.entries(stats).map(([id, s]) => ({ id, ...s })).sort((a, b) => b.total - a.total);
-  }, [history, leaderboardFilter]);
+  }, [history, leaderboardFilter, currentSingaporeDate]);
 
   // ─── Hall of Shame ───
   const hallOfShame = useMemo(() => {
@@ -638,6 +741,9 @@ function MahjongApp() {
     .btn { border: none; cursor: pointer; font-family: 'Outfit', sans-serif; transition: all 0.15s; }
     .btn:active { transform: scale(0.97); }
     .btn:disabled, .tab-btn:disabled { cursor: default; opacity: 0.5; }
+    .history-action { min-height: 44px; padding: 10px 14px; border-radius: 9px; font-size: 13px; font-weight: 500; }
+    .history-filter { width: 100%; min-height: 44px; margin-top: 6px; padding: 10px; border-radius: 9px; border: 1px solid rgba(255,255,255,0.16); background: #203420; color: #e8dcc8; font: inherit; font-size: 14px; color-scheme: dark; }
+    .btn:focus-visible, .tab-btn:focus-visible, .history-filter:focus-visible, summary:focus-visible { outline: 2px solid #c9a84c; outline-offset: 3px; }
     .chip { display: inline-flex; align-items: center; gap: 6px; padding: 10px 16px; border-radius: 10px; font-size: 14px; cursor: pointer; transition: all 0.15s; border: 2px solid transparent; user-select: none; }
     .chip:active { transform: scale(0.95); }
     .chip-on { border-color: #c9a84c; background: rgba(201,168,76,0.15); }
@@ -902,7 +1008,7 @@ function MahjongApp() {
       </div>
 
       <div style={{ display: "flex", padding: "12px 20px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
-        {[["new", "New Game"], ["players", "Players"], ["history", "History"], ["stats", "Stats"]].map(([key, label]) => (
+        {[["new", editingSession ? "Edit Game" : "New Game"], ["players", "Players"], ["history", "History"], ["stats", "Stats"]].map(([key, label]) => (
           <button key={key} className={`tab-btn ${tab === key ? "tab-active" : ""}`} disabled={saving} onClick={() => { if (!savingRef.current) setTab(key); }}>{label}</button>
         ))}
       </div>
@@ -912,6 +1018,13 @@ function MahjongApp() {
         {/* NEW GAME */}
         {tab === "new" && (
           <div style={{ animation: "fadeIn 0.3s" }}>
+            {editingSession && (
+              <div className="card" style={{ marginBottom: 20, borderColor: "rgba(201,168,76,0.35)" }}>
+                <div style={{ color: "#c9a84c", fontWeight: 600, marginBottom: 6 }}>Editing game from {formatGameDate(editingOriginalDate)}</div>
+                <div style={{ fontSize: 13, lineHeight: 1.5, opacity: 0.75 }}>Review your changes before saving. Cancel keeps the original game.</div>
+                <button className="btn history-action" disabled={saving} onClick={cancelEditing} style={{ marginTop: 10, background: "rgba(255,255,255,0.08)", color: "#e8dcc8" }}>Cancel editing</button>
+              </div>
+            )}
             {step === 1 && (
               <>
                 <div className="lbl">Select players (2–4)</div>
@@ -923,6 +1036,18 @@ function MahjongApp() {
                   </div>
                 ) : (
                   <>
+                    {!editingSession && lastSession && (
+                      <div style={{ marginBottom: 18 }}>
+                        <button className="btn" disabled={lastPlayerIds.length < 2} onClick={() => setSelPlayers([...lastPlayerIds])} style={{
+                          width: "100%", padding: "13px 16px", minHeight: 44, borderRadius: 12, fontSize: 14, fontWeight: 600,
+                          background: "rgba(201,168,76,0.12)", color: "#c9a84c", border: "1px solid rgba(201,168,76,0.3)",
+                        }}>Same players as last time</button>
+                        <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7, lineHeight: 1.5 }}>
+                          {lastPlayerIds.map(getName).join(" · ")}
+                          {lastPlayerIds.length !== Object.keys(lastSession.scores).length && <div>Some players from that game are no longer in the player list. Choose your group below.</div>}
+                        </div>
+                      </div>
+                    )}
                     <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 24 }}>
                       {players.map(p => (
                         <div key={p.id} className={`chip ${selPlayers.includes(p.id) ? "chip-on" : "chip-off"}`} onClick={() => togglePlayer(p.id)}>
@@ -942,14 +1067,15 @@ function MahjongApp() {
 
             {step === 2 && (
               <>
-                <div className="lbl">Game date</div>
-                <input type="date" value={gameDate} onChange={e => setGameDate(e.target.value)}
+                <label className="lbl" htmlFor="game-date" style={{ display: "block" }}>Game date · Singapore</label>
+                <input id="game-date" type="date" required aria-invalid={!validGameDate} value={gameDate} onChange={e => setGameDate(e.target.value)}
                   style={{
                     width: "100%", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.12)",
                     borderRadius: 10, padding: "12px 14px", color: "#c9a84c", fontSize: 15,
                     fontFamily: "'Outfit', sans-serif", outline: "none", marginBottom: 20,
                     colorScheme: "dark",
                   }} />
+                {!validGameDate && <div role="alert" style={{ color: "#e87c6c", fontSize: 13, marginBottom: 16 }}>Choose a valid game date to continue.</div>}
                 <div className="lbl">Enter final scores (S$)</div>
                 {selPlayers.map(id => (
                   <div key={id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "12px 0", borderBottom: "1px solid rgba(255,255,255,0.04)" }}>
@@ -984,11 +1110,11 @@ function MahjongApp() {
                 </div>
                 <div style={{ display: "flex", gap: 10 }}>
                   <button className="btn" onClick={() => setStep(1)} style={{ padding: "14px 20px", borderRadius: 12, background: "rgba(255,255,255,0.06)", color: "rgba(232,220,200,0.6)", fontSize: 15 }}>← Back</button>
-                  <button className="btn" disabled={!scoresValid()} onClick={() => setStep(3)} style={{
+                  <button className="btn" disabled={!scoresValid() || !validGameDate} onClick={() => { if (scoresValid() && validGameDate) setStep(3); }} style={{
                     flex: 1, padding: 16, borderRadius: 12, fontSize: 16, fontWeight: 600,
-                    background: scoresValid() ? "linear-gradient(135deg, #c9a84c, #a8893a)" : "rgba(255,255,255,0.06)",
-                    color: scoresValid() ? "#1a2e1a" : "rgba(232,220,200,0.2)",
-                  }}>Settle Up →</button>
+                    background: scoresValid() && validGameDate ? "linear-gradient(135deg, #c9a84c, #a8893a)" : "rgba(255,255,255,0.06)",
+                    color: scoresValid() && validGameDate ? "#1a2e1a" : "rgba(232,220,200,0.2)",
+                  }}>{editingSession ? "Review changes →" : "Settle Up →"}</button>
                 </div>
               </>
             )}
@@ -1036,7 +1162,7 @@ function MahjongApp() {
                 )}
                 <div style={{ display: "flex", gap: 10 }}>
                   <button className="btn" disabled={saving} onClick={() => { if (!savingRef.current) setStep(2); }} style={{ padding: "14px 20px", borderRadius: 12, background: "rgba(255,255,255,0.06)", color: "rgba(232,220,200,0.6)", fontSize: 15 }}>← Back</button>
-                  <button className="btn" disabled={saving} aria-busy={saving} onClick={confirmSettle} style={{ flex: 1, padding: 16, borderRadius: 12, fontSize: 16, fontWeight: 600, background: "linear-gradient(135deg, #7dce82, #5aad5f)", color: "#1a2e1a" }}>{saving ? "Saving…" : "Confirm & Save ✓"}</button>
+                  <button className="btn" disabled={saving} aria-busy={saving} onClick={confirmSettle} style={{ flex: 1, padding: 16, borderRadius: 12, fontSize: 16, fontWeight: 600, background: "linear-gradient(135deg, #7dce82, #5aad5f)", color: "#1a2e1a" }}>{saving ? "Saving…" : editingSession ? "Save changes" : "Confirm & Save ✓"}</button>
                 </div>
                 <button className="btn" onClick={shareWhatsApp} style={{
                   width: "100%", marginTop: 10, padding: 14, borderRadius: 12, fontSize: 14, fontWeight: 600,
@@ -1119,27 +1245,68 @@ function MahjongApp() {
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
               <div className="lbl" style={{ marginBottom: 0 }}>Past Sessions · {history.length}</div>
               {history.length > 0 && (
-                <button className="btn" onClick={exportCSV} style={{
+                <button className="btn" disabled={!filteredHistory.length} onClick={() => exportCSV(filteredHistory)} style={{
                   padding: "6px 12px", borderRadius: 8, fontSize: 12, fontWeight: 500,
                   background: "rgba(201,168,76,0.1)", color: "#c9a84c",
                   border: "1px solid rgba(201,168,76,0.2)",
-                }}>📥 Export CSV</button>
+                }}>{historyMonth === "all" && historyPlayer === "all" ? "📥 Export CSV" : "📥 Export shown"}</button>
               )}
             </div>
+            {historyNotice && <div role="status" style={{ color: "#7dce82", fontSize: 13, marginBottom: 14 }}>{historyNotice}</div>}
+            {historyError && <div role="alert" style={{ color: "#e87c6c", fontSize: 13, lineHeight: 1.5, marginBottom: 14 }}>{historyError}</div>}
+            {deletedSessions.length > 0 && (
+              <div className="card" style={{ marginBottom: 16 }}>
+                {deletedSessions.map(session => (
+                  <div key={session.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, marginBottom: 8 }}>
+                    <span style={{ fontSize: 13 }}>Deleted game from {formatGameDate(session.date, { day: "numeric", month: "short", year: "numeric" })}</span>
+                    <button className="btn history-action" disabled={sessionBusyIds.has(session.id)} onClick={() => undoDelete(session)} style={{ background: "rgba(201,168,76,0.15)", color: "#c9a84c", flexShrink: 0 }}>{sessionBusyIds.has(session.id) ? "Restoring…" : "Undo"}</button>
+                  </div>
+                ))}
+                <div style={{ fontSize: 12, lineHeight: 1.5, opacity: 0.7 }}>Undo is available until you refresh or close this page.</div>
+              </div>
+            )}
+            {(history.length > 0 || historyMonth !== "all" || historyPlayer !== "all") && (
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                  <label style={{ fontSize: 12, color: "rgba(232,220,200,0.75)", minWidth: 0 }}>Month
+                    <select className="history-filter" value={historyMonth} onChange={e => setHistoryMonth(e.target.value)}>
+                      <option value="all">All months</option>
+                      {[...new Set([...historyMonths, ...(historyMonth !== "all" ? [historyMonth] : [])])].sort().reverse().map(month => (
+                        <option key={month} value={month}>{formatGameDate(`${month}-01`, { month: "long", year: "numeric" })}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label style={{ fontSize: 12, color: "rgba(232,220,200,0.75)", minWidth: 0 }}>Player
+                    <select className="history-filter" value={historyPlayer} onChange={e => setHistoryPlayer(e.target.value)}>
+                      <option value="all">All players</option>
+                      {[...new Set([...historyPlayerIds, ...(historyPlayer !== "all" ? [historyPlayer] : [])])].map(id => (
+                        <option key={id} value={id}>{getName(id) === "Unknown" ? `Removed player (${id})` : getName(id)}</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginTop: 8 }}>
+                  <span style={{ fontSize: 12, opacity: 0.7 }}>Showing {filteredHistory.length} of {history.length} games</span>
+                  {(historyMonth !== "all" || historyPlayer !== "all") && <button className="btn history-action" onClick={() => { setHistoryMonth("all"); setHistoryPlayer("all"); }} style={{ color: "#c9a84c", background: "transparent" }}>Clear filters</button>}
+                </div>
+              </div>
+            )}
             {!history.length ? (
               <div style={{ textAlign: "center", padding: "50px 20px", opacity: 0.4 }}>No sessions yet</div>
-            ) : history.map(h => {
+            ) : !filteredHistory.length ? (
+              <div style={{ textAlign: "center", padding: "40px 20px", opacity: 0.7, fontSize: 14 }}>No games match these filters. Try another month or player.</div>
+            ) : filteredHistory.map(h => {
               if (!h.scores) return null;
               const sorted = Object.entries(h.scores).sort((a, b) => b[1] - a[1]);
               return (
                 <div key={h.id} className="card" style={{ marginBottom: 12 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 12 }}>
                     <span style={{ fontWeight: 600, color: "#c9a84c" }}>
-                      {new Date(h.date).toLocaleDateString("en-SG", { weekday: "short", day: "numeric", month: "short", year: "numeric" })}
+                      {formatGameDate(h.date, { weekday: "short", day: "numeric", month: "short", year: "numeric" })}
                     </span>
                     <div style={{ display: "flex", gap: 6 }}>
-                      <button className="btn" onClick={() => editSession(h)} style={{ background: "rgba(255,255,255,0.08)", borderRadius: 6, padding: "4px 10px", color: "rgba(232,220,200,0.5)", fontSize: 11 }}>Edit</button>
-                      <button className="btn" onClick={() => deleteSession(h.id)} style={{ background: "rgba(232,124,108,0.1)", borderRadius: 6, padding: "4px 10px", color: "rgba(232,124,108,0.5)", fontSize: 11 }}>✕</button>
+                      <button className="btn history-action" disabled={sessionBusyIds.has(h.id)} onClick={() => editSession(h)} style={{ background: "rgba(255,255,255,0.08)", color: "#e8dcc8" }}>Edit</button>
+                      <button className="btn history-action" disabled={sessionBusyIds.has(h.id)} onClick={() => deleteSession(h)} style={{ background: "rgba(232,124,108,0.1)", color: "#e87c6c" }}>{sessionBusyIds.has(h.id) ? "Deleting…" : "Delete"}</button>
                     </div>
                   </div>
                   {sorted.map(([id, val]) => (
@@ -1150,14 +1317,14 @@ function MahjongApp() {
                     </div>
                   ))}
                   {h.transactions?.length > 0 && (
-                    <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
-                      <div style={{ fontSize: 11, opacity: 0.3, marginBottom: 6 }}>PAYMENTS</div>
+                    <details style={{ marginTop: 10, borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                      <summary style={{ minHeight: 44, padding: "13px 0", cursor: "pointer", color: "#c9a84c", fontSize: 13 }}>Who pays whom · {h.transactions.length} {h.transactions.length === 1 ? "payment" : "payments"}</summary>
                       {h.transactions.map((t, i) => (
                         <div key={i} style={{ fontSize: 13, opacity: 0.6, padding: "2px 0" }}>
                           {getName(t.from)} → {getName(t.to)}: <span style={{ color: "#7dce82" }}>${t.amount.toFixed(2)}</span>
                         </div>
                       ))}
-                    </div>
+                    </details>
                   )}
                 </div>
               );
@@ -1211,7 +1378,7 @@ function MahjongApp() {
                     </div>
                     <div style={{ textAlign: "right" }}>
                       <span className="pos" style={{ fontFamily: "'Crimson Pro', serif", fontWeight: 700, fontSize: 18 }}>+${hallOfShame.biggest.score.toFixed(2)}</span>
-                      <div style={{ fontSize: 10, opacity: 0.3 }}>{new Date(hallOfShame.biggest.date).toLocaleDateString("en-SG", { day: "numeric", month: "short" })}</div>
+                      <div style={{ fontSize: 10, opacity: 0.3 }}>{formatGameDate(hallOfShame.biggest.date, { day: "numeric", month: "short" })}</div>
                     </div>
                   </div>
                 )}
@@ -1226,7 +1393,7 @@ function MahjongApp() {
                     </div>
                     <div style={{ textAlign: "right" }}>
                       <span className="neg" style={{ fontFamily: "'Crimson Pro', serif", fontWeight: 700, fontSize: 18 }}>${hallOfShame.worst.score.toFixed(2)}</span>
-                      <div style={{ fontSize: 10, opacity: 0.3 }}>{new Date(hallOfShame.worst.date).toLocaleDateString("en-SG", { day: "numeric", month: "short" })}</div>
+                      <div style={{ fontSize: 10, opacity: 0.3 }}>{formatGameDate(hallOfShame.worst.date, { day: "numeric", month: "short" })}</div>
                     </div>
                   </div>
                 )}
@@ -1237,7 +1404,7 @@ function MahjongApp() {
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
               <div className="lbl" style={{ marginBottom: 0 }}>Leaderboard</div>
               <div style={{ display: "flex", gap: 4 }}>
-                {[["all", "All Time"], ["year", new Date().getFullYear().toString()], ["month", new Date().toLocaleDateString("en-SG", { month: "short" })]].map(([key, label]) => (
+                {[["all", "All Time"], ["year", currentSingaporeDate.slice(0, 4)], ["month", formatGameDate(currentSingaporeDate, { month: "short" })]].map(([key, label]) => (
                   <button key={key} className="btn" onClick={() => setLeaderboardFilter(key)} style={{
                     padding: "4px 10px", borderRadius: 6, fontSize: 11, fontWeight: 600,
                     background: leaderboardFilter === key ? "rgba(201,168,76,0.2)" : "rgba(255,255,255,0.04)",
