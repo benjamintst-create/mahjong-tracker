@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { LineChart, Line, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, ReferenceLine, Cell } from "recharts";
 import { db } from "./firebase";
 import {
@@ -8,6 +8,32 @@ import {
 const MAX_PLAYERS = 20;
 const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
 const AUTH_KEY = "mj-auth-v1";
+
+// BEGIN TEMPORARY DUPLICATE CLEANUP: grouping helper.
+// Remove this block and the two matching blocks in MahjongApp after cleanup.
+function findDuplicateGroups(history) {
+  const groups = new Map();
+  history.forEach(session => {
+    if (typeof session.date !== "string" || !session.scores || Array.isArray(session.scores)) return;
+    const pairs = Object.entries(session.scores).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
+    if (!pairs.length || pairs.some(([, score]) => typeof score !== "number" || !Number.isFinite(score))) return;
+    const date = session.date.slice(0, 10);
+    const key = JSON.stringify([date, pairs]);
+    if (!groups.has(key)) groups.set(key, { key, date, pairs, sessions: [] });
+    groups.get(key).sessions.push(session);
+  });
+  return [...groups.values()].filter(group => group.sessions.length > 1).map(group => {
+    // Keep the earliest stored date/time. Equal dates use the lowest document ID.
+    // genId() starts with a timestamp, but the schema has no authoritative createdAt.
+    // Sort copies only; History must remain newest-first.
+    const sessions = [...group.sessions].sort((a, b) => {
+      if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+    });
+    return { ...group, sessions, extras: sessions.slice(1) };
+  });
+}
+// END TEMPORARY DUPLICATE CLEANUP: grouping helper.
 
 function PasswordGate({ onAuth }) {
   const [pw, setPw] = useState("");
@@ -157,6 +183,10 @@ function MahjongApp() {
   const [scores, setScores] = useState({});
   const [step, setStep] = useState(1);
   const [editingSession, setEditingSession] = useState(null);
+  const [draftId, setDraftId] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [saveError, setSaveError] = useState(null);
   const [gameDate, setGameDate] = useState(() => new Date().toISOString().split("T")[0]);
 
   const [viewPlayer, setViewPlayer] = useState(null);
@@ -238,6 +268,38 @@ function MahjongApp() {
     await deleteDoc(doc(db, "sessions", id));
   };
 
+  // BEGIN TEMPORARY DUPLICATE CLEANUP: state and action.
+  const [cleaningDuplicates, setCleaningDuplicates] = useState(false);
+  const cleanupRef = useRef(false);
+  const [cleanupError, setCleanupError] = useState(null);
+  const duplicateGroups = useMemo(() => findDuplicateGroups(history), [history]);
+  const extraCopyCount = duplicateGroups.reduce((count, group) => count + group.extras.length, 0);
+
+  const removeDuplicateSessions = async () => {
+    if (cleanupRef.current || savingRef.current || !extraCopyCount) return;
+    const extras = duplicateGroups.flatMap(group => group.extras);
+    if (!confirm(`Remove ${extras.length} extra ${extras.length === 1 ? "copy" : "copies"} from ${duplicateGroups.length} duplicate ${duplicateGroups.length === 1 ? "group" : "groups"}?\n\nEach group has the same date and exactly the same player scores. The earliest stored session date/time is kept; tied dates use the lowest document ID.\n\nPlease check the groups first. These deletions cannot be undone here.`)) return;
+
+    cleanupRef.current = true;
+    setCleaningDuplicates(true);
+    setCleanupError(null);
+    let removed = 0;
+    try {
+      for (const session of extras) {
+        await fbDeleteSession(session.id);
+        removed += 1;
+      }
+      // The existing Firestore listener refreshes History and all statistics.
+    } catch (err) {
+      console.error("Duplicate cleanup failed:", err);
+      setCleanupError(`Cleanup stopped after ${removed} confirmed ${removed === 1 ? "deletion" : "deletions"}. Check your connection and permissions, then review the remaining groups and retry.`);
+    } finally {
+      cleanupRef.current = false;
+      setCleaningDuplicates(false);
+    }
+  };
+  // END TEMPORARY DUPLICATE CLEANUP: state and action.
+
   // ─── Player actions ───
   const addPlayer = async () => {
     const name = newName.trim();
@@ -281,7 +343,10 @@ function MahjongApp() {
   };
 
   const startScoreEntry = () => {
-    if (selPlayers.length < 2) return;
+    if (savingRef.current || selPlayers.length < 2) return;
+    // Keep the same ID when going Back or retrying an uncertain/failed save.
+    if (!editingSession) setDraftId(current => current || genId());
+    setSaveError(null);
     const s = {}; selPlayers.forEach(id => (s[id] = "")); setScores(s); setGameDate(new Date().toISOString().split("T")[0]); setStep(2);
   };
 
@@ -299,27 +364,51 @@ function MahjongApp() {
   const getTotal = () => Object.values(scores).reduce((s, v) => { const n = parseFloat(v); return s + (isNaN(n) ? 0 : n); }, 0);
 
   const confirmSettle = async () => {
-    const parsed = {};
-    Object.entries(scores).forEach(([id, v]) => (parsed[id] = parseFloat(v)));
-    // Detect rivalries before saving
-    if (!editingSession) {
-      const alerts = detectRivalries(parsed);
-      if (alerts.length > 0) setRivalryAlert(alerts);
+    if (savingRef.current) return;
+    const sessionId = editingSession || draftId;
+    if (!sessionId) {
+      setSaveError("No active session draft. Go back to player selection and start score entry again.");
+      return;
     }
-    const session = {
-      id: editingSession || genId(),
-      date: new Date(gameDate + "T20:00:00").toISOString(),
-      scores: parsed,
-      transactions: minimizeTransactions(parsed),
-    };
-    await fbSaveSession(session);
-    resetForm();
-    setTab("history");
+    if (!scoresValid()) {
+      setSaveError("Enter all scores and make sure they total $0.00 before saving.");
+      return;
+    }
+
+    // A ref closes the double-tap window before React renders the disabled button.
+    savingRef.current = true;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const parsed = {};
+      Object.entries(scores).forEach(([id, v]) => (parsed[id] = parseFloat(v)));
+      // Calculate against the pre-save rankings, but show alerts only after success.
+      const alerts = editingSession ? [] : detectRivalries(parsed, sessionId);
+      const session = {
+        id: sessionId,
+        date: new Date(gameDate + "T20:00:00").toISOString(),
+        scores: parsed,
+        transactions: minimizeTransactions(parsed),
+      };
+      await fbSaveSession(session);
+      if (alerts.length > 0) setRivalryAlert(alerts);
+      resetForm();
+      setTab("history");
+    } catch (err) {
+      console.error("Session save failed:", err);
+      setSaveError("Couldn't save the session. Your scores and date are still here. Check your connection and permissions, then try again.");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   };
 
-  const resetForm = () => { setSelPlayers([]); setScores({}); setStep(1); setEditingSession(null); setGameDate(new Date().toISOString().split("T")[0]); };
+  const resetForm = () => { setSelPlayers([]); setScores({}); setStep(1); setEditingSession(null); setDraftId(null); setSaveError(null); setGameDate(new Date().toISOString().split("T")[0]); };
 
   const editSession = (session) => {
+    if (savingRef.current) return;
+    setDraftId(null);
+    setSaveError(null);
     setEditingSession(session.id);
     const ids = Object.keys(session.scores);
     setSelPlayers(ids);
@@ -506,11 +595,12 @@ function MahjongApp() {
   }, [history]);
 
   // ─── Rivalry detection ───
-  const detectRivalries = (newScores) => {
+  const detectRivalries = (newScores, sessionId) => {
     // Build old rankings from history
     const oldTotals = {};
     history.forEach(h => {
-      if (!h.scores) return;
+      // A previous attempt may already be visible in a local/server snapshot.
+      if (!h.scores || h.id === sessionId) return;
       Object.entries(h.scores).forEach(([id, score]) => {
         oldTotals[id] = (oldTotals[id] || 0) + score;
       });
@@ -547,6 +637,7 @@ function MahjongApp() {
     .card { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.08); border-radius: 14px; padding: 16px; }
     .btn { border: none; cursor: pointer; font-family: 'Outfit', sans-serif; transition: all 0.15s; }
     .btn:active { transform: scale(0.97); }
+    .btn:disabled, .tab-btn:disabled { cursor: default; opacity: 0.5; }
     .chip { display: inline-flex; align-items: center; gap: 6px; padding: 10px 16px; border-radius: 10px; font-size: 14px; cursor: pointer; transition: all 0.15s; border: 2px solid transparent; user-select: none; }
     .chip:active { transform: scale(0.95); }
     .chip-on { border-color: #c9a84c; background: rgba(201,168,76,0.15); }
@@ -812,7 +903,7 @@ function MahjongApp() {
 
       <div style={{ display: "flex", padding: "12px 20px 0", borderBottom: "1px solid rgba(255,255,255,0.06)" }}>
         {[["new", "New Game"], ["players", "Players"], ["history", "History"], ["stats", "Stats"]].map(([key, label]) => (
-          <button key={key} className={`tab-btn ${tab === key ? "tab-active" : ""}`} onClick={() => setTab(key)}>{label}</button>
+          <button key={key} className={`tab-btn ${tab === key ? "tab-active" : ""}`} disabled={saving} onClick={() => { if (!savingRef.current) setTab(key); }}>{label}</button>
         ))}
       </div>
 
@@ -940,9 +1031,12 @@ function MahjongApp() {
                     </div>
                   );
                 })()}
+                {saveError && (
+                  <div role="alert" style={{ marginBottom: 12, color: "#e87c6c", fontSize: 13, lineHeight: 1.5 }}>{saveError}</div>
+                )}
                 <div style={{ display: "flex", gap: 10 }}>
-                  <button className="btn" onClick={() => setStep(2)} style={{ padding: "14px 20px", borderRadius: 12, background: "rgba(255,255,255,0.06)", color: "rgba(232,220,200,0.6)", fontSize: 15 }}>← Back</button>
-                  <button className="btn" onClick={confirmSettle} style={{ flex: 1, padding: 16, borderRadius: 12, fontSize: 16, fontWeight: 600, background: "linear-gradient(135deg, #7dce82, #5aad5f)", color: "#1a2e1a" }}>Confirm & Save ✓</button>
+                  <button className="btn" disabled={saving} onClick={() => { if (!savingRef.current) setStep(2); }} style={{ padding: "14px 20px", borderRadius: 12, background: "rgba(255,255,255,0.06)", color: "rgba(232,220,200,0.6)", fontSize: 15 }}>← Back</button>
+                  <button className="btn" disabled={saving} aria-busy={saving} onClick={confirmSettle} style={{ flex: 1, padding: 16, borderRadius: 12, fontSize: 16, fontWeight: 600, background: "linear-gradient(135deg, #7dce82, #5aad5f)", color: "#1a2e1a" }}>{saving ? "Saving…" : "Confirm & Save ✓"}</button>
                 </div>
                 <button className="btn" onClick={shareWhatsApp} style={{
                   width: "100%", marginTop: 10, padding: 14, borderRadius: 12, fontSize: 14, fontWeight: 600,
@@ -991,6 +1085,37 @@ function MahjongApp() {
         {/* HISTORY */}
         {tab === "history" && (
           <div style={{ animation: "fadeIn 0.3s" }}>
+            {/* BEGIN TEMPORARY DUPLICATE CLEANUP: History card. */}
+            {cleanupError && (
+              <div role="alert" style={{ marginBottom: 14, color: "#e87c6c", fontSize: 13, lineHeight: 1.5 }}>{cleanupError}</div>
+            )}
+            {duplicateGroups.length > 0 && (
+              <div className="card" style={{ marginBottom: 20, borderColor: "rgba(201,168,76,0.3)" }}>
+                <div style={{ color: "#c9a84c", fontWeight: 600, marginBottom: 8 }}>Possible duplicates</div>
+                <div style={{ fontSize: 12, opacity: 0.6, lineHeight: 1.5, marginBottom: 12 }}>
+                  These sessions have the same date and identical player scores. Review them before removing extra copies.
+                </div>
+                {duplicateGroups.map(group => (
+                  <div key={group.key} style={{ padding: "12px 0", borderTop: "1px solid rgba(255,255,255,0.06)" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 10, marginBottom: 8, fontSize: 13 }}>
+                      <span style={{ fontWeight: 600 }}>{group.date}</span>
+                      <span style={{ color: "#c9a84c" }}>{group.sessions.length} copies</span>
+                    </div>
+                    {group.pairs.map(([id, score]) => (
+                      <div key={id} style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "3px 0", fontSize: 13 }}>
+                        <span>{getEmoji(id)} {getName(id) === "Unknown" ? `Unknown (${id})` : getName(id)}</span>
+                        <span className={score > 0.005 ? "pos" : score < -0.005 ? "neg" : "zero"}>{score > 0 ? "+" : ""}${score.toFixed(2)}</span>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+                <button className="btn" disabled={cleaningDuplicates || saving} onClick={removeDuplicateSessions} style={{
+                  width: "100%", marginTop: 12, padding: 14, borderRadius: 12, fontSize: 14, fontWeight: 600,
+                  background: "rgba(232,124,108,0.12)", color: "#e87c6c", border: "1px solid rgba(232,124,108,0.25)",
+                }}>{cleaningDuplicates ? "Removing…" : `Remove ${extraCopyCount} extra ${extraCopyCount === 1 ? "copy" : "copies"}`}</button>
+              </div>
+            )}
+            {/* END TEMPORARY DUPLICATE CLEANUP: History card. */}
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
               <div className="lbl" style={{ marginBottom: 0 }}>Past Sessions · {history.length}</div>
               {history.length > 0 && (
