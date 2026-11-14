@@ -1420,28 +1420,28 @@ function MahjongApp() {
               const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : null;
               return (
                 <div key={s.id} onClick={() => setViewPlayer(s.id)} style={{
-                  display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, padding: "14px 16px", marginBottom: 8, borderRadius: 12, cursor: "pointer",
+                  display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "14px 12px", marginBottom: 8, borderRadius: 12, cursor: "pointer",
                   background: i === 0 ? "rgba(201,168,76,0.08)" : "rgba(255,255,255,0.03)",
                   border: `1px solid ${i === 0 ? "rgba(201,168,76,0.15)" : "rgba(255,255,255,0.05)"}`,
                 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-                    <span style={{ fontSize: 20, width: 28, textAlign: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                    <span style={{ fontSize: 20, width: 24, textAlign: "center", flexShrink: 0 }}>
                       {medal || <span style={{ opacity: 0.3, fontSize: 14 }}>#{i + 1}</span>}
                     </span>
-                    <span style={{ fontSize: 18 }}>{getEmoji(s.id)}</span>
-                    <div>
+                    <span style={{ fontSize: 18, flexShrink: 0 }}>{getEmoji(s.id)}</span>
+                    <div style={{ minWidth: 0 }}>
                       <div style={{ fontWeight: 600 }}>{getName(s.id)}</div>
                       <div style={{ fontSize: 12, opacity: 0.4 }}>{s.games} session{s.games > 1 ? "s" : ""} · {s.wins}W {s.losses}L</div>
                     </div>
                   </div>
-                  <div style={{ display: "flex", flexWrap: "wrap", alignItems: "baseline", justifyContent: "flex-end", columnGap: 6, minWidth: 0 }}>
-                    <span className={s.total > 0.005 ? "pos" : s.total < -0.005 ? "neg" : "zero"}
-                      style={{ fontFamily: "'Crimson Pro', serif", fontSize: 22, fontWeight: 700, whiteSpace: "nowrap" }}>{s.total > 0 ? "+" : ""}${s.total.toFixed(2)}</span>
-                    <span style={{ fontSize: 12, whiteSpace: "nowrap" }}>
-                      <span style={{ opacity: 0.5 }}>/ </span>
-                      <span className={s.avg > 0.005 ? "pos" : s.avg < -0.005 ? "neg" : "zero"} style={{ fontWeight: 600 }}>{s.avg > 0 ? "+" : ""}${s.avg.toFixed(2)}</span>
-                      <span style={{ opacity: 0.5 }}> per session</span>
-                    </span>
+                  <div style={{ textAlign: "right", flexShrink: 0, whiteSpace: "nowrap" }}>
+                    <div>
+                      <span className={s.total > 0.005 ? "pos" : s.total < -0.005 ? "neg" : "zero"}
+                        style={{ fontFamily: "'Crimson Pro', serif", fontSize: 22, fontWeight: 700 }}>{s.total > 0 ? "+" : ""}${s.total.toFixed(2)}</span>
+                      <span style={{ fontSize: 12, opacity: 0.5 }}> / </span>
+                      <span className={s.avg > 0.005 ? "pos" : s.avg < -0.005 ? "neg" : "zero"} style={{ fontSize: 12, fontWeight: 600 }}>{s.avg > 0 ? "+" : ""}${s.avg.toFixed(2)}</span>
+                    </div>
+                    <div style={{ fontSize: 11, opacity: 0.4 }}>per session</div>
                   </div>
                 </div>
               );
